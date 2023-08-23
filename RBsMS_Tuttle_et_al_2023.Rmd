@@ -1,0 +1,998 @@
+---
+title: "nechiporuk_10x_analysis"
+author: "nlc, avn"
+date: "4/27/2020"
+output:   
+  html_document: 
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+    toc_collapsed: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, fig.align = 'center', out.width = '90%')
+```
+
+<style>
+    body .main-container {
+        max-width: 2160px;
+    }
+</style>
+
+# Set up
+
+## Load libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(MAST)
+library(ggrepel)
+library(biomaRt)
+```
+
+## Load data
+```{r}
+
+data_folder1 <- "day4_1"
+
+DAY4_1_data <- Read10X(data.dir = data_folder1)
+
+DAY4_1 <- CreateSeuratObject(counts = DAY4_1_data,
+                           project = "DAY4_1", min.cells = 3, min.features = 200)
+
+data_folder1 <- "day4_2"
+
+DAY4_2_data <- Read10X(data.dir = data_folder1)
+
+DAY4_2 <- CreateSeuratObject(counts = DAY4_2_data,
+                           project = "DAY4_2", min.cells = 3, min.features = 200)
+
+data_folder2 <- "day7_1"
+
+DAY7_1_data <- Read10X(data.dir = data_folder2)
+
+DAY7_1 <- CreateSeuratObject(counts = DAY7_1_data,
+                           project = "DAY7_1", min.cells = 3, min.features = 200)
+
+
+```
+
+
+```{r}
+data.combined <- merge(x = DAY4_1, y = c(DAY4_2, DAY7_1), add.cell.ids = c("DAY4_1", "DAY4_2", "DAY7_1"), project = "data.combined")
+data.combined
+data.combined[['condition']] <- str_split(data.combined@meta.data$orig.ident, pattern = '_', simplify = TRUE)[,1]
+head(colnames(data.combined))
+table(data.combined$orig.ident)
+
+```
+
+
+# 'Standard' Seurat analysis
+
+## Assign mitochondrial percent
+
+*NOTE (NLC):* zebrafish mitochondrial genes have a lowercase prefix, using the regex pattern '^mt-' appeared to work, however only 13 mitchondrial genes are present.
+
+```{r}
+data.combined[["percent.mt"]] <- PercentageFeatureSet(data.combined, pattern = "^mt-|^COX3$")
+# Visualize QC metrics as a violin plot
+VlnPlot(data.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+
+
+```
+
+## QC visualization
+
+*Note (AN):* FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+*Note (NLC):* zebrafish mitochondrial genes have a lowercase prefix, 
+
+Run this chunk to manually set cutoffs:
+
+```{r, eval = TRUE}
+nCount_RNA_limits <- c(1e3, 7.5e4)
+
+nFeature_RNA_limits <- c(1900, 9000)
+
+percent_mt_limits <- c(0, 5)
+```
+
+
+```{r}
+
+FeatureScatter(data.combined, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = "orig.ident")+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = percent_mt_limits, linetype = 'dashed', size = 1.5)
+
+FeatureScatter(data.combined, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "orig.ident")+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)
+
+data.combined_metadata <- data.combined@meta.data
+
+ggplot(data.combined_metadata, aes(x = nCount_RNA, y = nFeature_RNA))+
+  geom_point(alpha = 0.1)+
+  geom_density2d()+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)+
+  scale_x_log10()
+
+ggplot(data.combined_metadata, aes(x = nCount_RNA/nFeature_RNA, y = nFeature_RNA))+
+  geom_point(alpha = 0.1)+
+  geom_density2d()+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)
+
+```
+
+## Subset data
+
+```{r}
+#Display counts before pruning
+print('Cell count before pruning:')
+table(data.combined@meta.data$orig.ident)
+
+data.combined <- subset(data.combined, subset = nFeature_RNA > min(nFeature_RNA_limits) & nFeature_RNA < max(nFeature_RNA_limits) & nCount_RNA > min(nCount_RNA_limits) & nCount_RNA < max(nCount_RNA_limits) & percent.mt > min(percent_mt_limits) & percent.mt < max(percent_mt_limits))
+
+#Display counts after pruning
+print('Cell count after pruning:')
+table(data.combined@meta.data$orig.ident)
+
+```
+
+## Ancor and normalize data
+```{r}
+data.combined.list <- SplitObject(data.combined, split.by = "orig.ident")
+
+data.combined.list <- lapply(X = data.combined.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+anchors <- FindIntegrationAnchors(object.list = data.combined.list, dims = 1:20)
+data.combined <- IntegrateData(anchorset = anchors, dims = 1:20)
+```
+
+
+## Identify variable features and scale data
+
+```{r}
+# Run the standard workflow for visualization and clustering
+
+DefaultAssay(data.combined) <- "integrated"
+data.combined <- ScaleData(data.combined, features = row.names(data.combined), verbose = FALSE)
+data.combined <- RunPCA(data.combined, npcs = 30, verbose = FALSE)
+
+DimPlot(data.combined, reduction = 'pca')
+ElbowPlot(data.combined, ndims = 30)+
+  geom_vline(xintercept = 10.5)
+
+# t-SNE and Clustering
+data.combined <- RunUMAP(data.combined, reduction = "pca", dims = 1:20)
+data.combined <- FindNeighbors(data.combined, reduction = "pca", dims = 1:20)
+data.combined <- FindClusters(data.combined, resolution = 1)
+
+main_plot <- DimPlot(data.combined, reduction = 'umap', label = T, label.size = 5)+
+  coord_equal()
+ggsave("outs/main_plot.jpeg", main_plot, dpi = 600)
+
+DimPlot(data.combined, reduction = 'umap', group.by = 'condition')+
+  coord_equal()
+
+```
+
+# Directed analysis
+```{r}
+
+DefaultAssay(data.combined) <- "RNA"
+#neurons 
+snap25b <- FeaturePlot(data.combined, features = c('snap25b'), min.cutoff = 0.1, order = T, pt.size=.8)+
+  coord_equal()
+ggsave("outs/snap25b.jpeg", snap25b, dpi=600)
+
+#glia
+gfap <- FeaturePlot(data.combined, features = c('gfap'), min.cutoff = 0.1, order = T, pt.size=0.8)+
+  coord_equal()
+ggsave("outs/gfap.jpeg", gfap, dpi=600)
+
+#RBs
+isl2a <- FeaturePlot(data.combined, features = c('isl2a') ,min.cutoff = 0.1, order = T, pt.size=0.8)+
+  coord_equal()
+ggsave("outs/isl2a.jpeg", isl2a, dpi=600)
+
+prdm14 <- FeaturePlot(data.combined, features = c("prdm14"), min.cutoff = 0.1, order = T, pt.size=0.8)+
+  coord_equal()
+ggsave("outs/prdm14.jpeg", prdm14, dpi=600)
+
+```
+
+## Identify features for RB clusters
+
+```{r}
+all_markers <- FindMarkers(data.combined, ident.1 = c(24,29),  assay ="RNA",  only.pos = TRUE, logfc.threshold = 0.5)
+
+write.csv(all_markers, file = "outs/allRB_markers.csv")
+
+```
+
+
+## Look at cluster identity versus condition
+```{r}
+data.combined.meta <- data.combined@meta.data
+
+ggplot(data.combined.meta, aes(x = seurat_clusters, fill = orig.ident))+
+  geom_bar(position = 'dodge')
+```
+
+## 'Automatic' subset and analysis a particular cluster
+```{r}
+
+#Set the subset cluster(s) that you're interested in
+
+subset_cluster_id <- c(24, 29)
+DefaultAssay(data.combined) <- "integrated"
+##
+##The code below is designed to run automatically once the subset ids are selected above
+##
+
+print('Running automated ~analysis~ on the following clusters:')
+print(subset_cluster_id)
+
+#Pull the subset
+data.combined_subset <- subset(data.combined, subset = seurat_clusters %in% subset_cluster_id)
+#stash the original cluster identities
+data.combined_subset@meta.data$original_seurat_clusters <- data.combined_subset@meta.data$seurat_clusters
+
+#Perform relatively hands-free analysis of the selected clusters
+data.combined_subset <- FindVariableFeatures(data.combined_subset)
+data.combined_subset <- RunPCA(data.combined_subset)
+ElbowPlot(data.combined_subset)
+
+data.combined_subset <- FindNeighbors(data.combined_subset, dims = 1:7)
+data.combined_subset <- FindClusters(data.combined_subset, resolution = .2)
+data.combined_subset <- RunUMAP(data.combined_subset, dims = 1:7)
+
+subset_plot1 <- DimPlot(data.combined_subset, label = TRUE, label.size = 10, group.by = 'seurat_clusters')+
+  ggtitle('New clusters')
+subset_plot2 <- DimPlot(data.combined_subset, label = TRUE, label.size = 10, group.by = 'original_seurat_clusters')+
+  ggtitle('Original cluster identities')
+
+subset_plot1+subset_plot2
+
+DimPlot(data.combined_subset, reduction = 'umap', group.by = 'condition')+
+  coord_equal()
+
+data.combined.subset.meta <- data.combined_subset@meta.data
+
+ggplot(data.combined.subset.meta, aes(x = seurat_clusters, fill = orig.ident))+
+  geom_bar(position = 'dodge') +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 1.5, colour = "black", position = position_dodge(.9))
+
+#total number of cells in each RB cluster
+table(data.combined_subset@meta.data$integrated_snn_res.0.2)
+
+```
+
+##Rename clusters
+```{r}
+
+new.cluster.ids <- c("kitb+", "calca+",  "adcyap1a+")
+names(new.cluster.ids) <- levels(data.combined_subset)
+RB_names <- RenameIdents(data.combined_subset, new.cluster.ids)
+DimPlot(RB_names, reduction = "umap", label = T, label.size = 7, pt.size = 1) + NoLegend()
+
+RB_names$cluster_ID <- Idents(RB_names)
+RB_names.meta <- RB_names@meta.data
+bar_plot <- ggplot(RB_names.meta, aes(x = seurat_clusters, fill = orig.ident))+
+  geom_bar(position = 'dodge')+theme_bw() 
+ggsave("outs/bar_plot.jpeg", bar_plot, dpi=600)
+saveRDS(RB_names, "outs/RB_names")
+```
+
+##Differential gene expression in RBs
+```{r}
+
+#kitb cluster
+RB.markers_0 <- FindMarkers(RB_names, ident.1 = "kitb+", assay ="RNA",  only.pos = TRUE, logfc.threshold = 0.5)
+
+# view and save results
+head(RB.markers_0, n=10)
+write.csv(RB.markers_0, file = "outs/kit_cluster.csv")
+
+#calca cluster
+RB.markers_1 <- FindMarkers(RB_names, ident.1 = "calca+", only.pos = TRUE, assay = "RNA", logfc.threshold = 0.5)
+
+# view and save results
+head(RB.markers_1, n=10)
+write.csv(RB.markers_1, file = "outs/calca_cluster.csv")
+
+#adcyap cluster
+RB.markers_2 <- FindMarkers(RB_names, ident.1 = "adcyap1a+", only.pos = TRUE, assay = "RNA", logfc.threshold = 0.5)
+
+# view and save results
+head(RB.markers_2, n=10)
+write.csv(RB.markers_2, file = "outs/adcyap_cluster.csv")
+
+```
+
+
+##RB marker analysis
+```{r}
+
+DefaultAssay(data.combined_subset) <- "RNA"
+#general RB markers
+prdm14 <- FeaturePlot(data.combined_subset, features = c("prdm14"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/prdm14.jpeg", prdm14, dpi = 300)
+
+fgf13a <- FeaturePlot(data.combined_subset, features = c("fgf13a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/fgf13a.jpeg", fgf13a, dpi = 300)
+
+isl2a <- FeaturePlot(data.combined_subset, features = c("isl2a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/isl2a.jpeg", isl2a, dpi = 300)
+
+#cluster 0 (kitb+)
+kitb <- FeaturePlot(data.combined_subset, features = c("kitb"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/kitb.jpeg", kitb, dpi = 300)
+
+trpc4a <- FeaturePlot(data.combined_subset, features = c("trpc4a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/trpc4a.jpeg", trpc4a, dpi = 300)
+
+p2rx3a <- FeaturePlot(data.combined_subset, features = c("p2rx3a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/p2rx3a.jpeg", p2rx3a, dpi = 300)
+
+#cluster 1 (calca+)
+calca <- FeaturePlot(data.combined_subset, features = c("calca"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/calca.jpeg", calca, dpi = 300)
+
+tmem178 <- FeaturePlot(data.combined_subset, features = c("tmem178"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/tmem178.jpeg", tmem178, dpi = 300)
+
+c1qtnf4 <- FeaturePlot(data.combined_subset, features = c("c1qtnf4"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/c1qtnf4.jpeg", c1qtnf4, dpi = 300)
+
+#cluster 2 (adcyap1a+)
+adcyap1a <- FeaturePlot(data.combined_subset, features = c("adcyap1a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/adcyap1a.jpeg", adcyap1a, dpi = 300)
+
+caln2 <- FeaturePlot(data.combined_subset, features = c("caln2"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/caln2.jpeg", caln2, dpi = 300)
+
+prickle1a <- FeaturePlot(data.combined_subset, features = c("prickle1a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/prickle1a.jpeg", prickle1a, dpi = 300)
+
+#FGF pathway member expression
+etv5a <- FeaturePlot(data.combined_subset, features = c("etv5a"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/etv5a.jpeg", etv5a, dpi = 300)
+
+etv4 <- FeaturePlot(data.combined_subset, features = c("etv4"), order = T,
+            min = 0.1,
+            pt.size = 2)+ NoAxes()
+ggsave("outs/etv4.jpeg", etv4, dpi = 300)
+
+```
+
+##RB heatmap
+```{r}
+subset_features <- FindAllMarkers(data.combined_subset, only.pos = TRUE, assay = "RNA", logfc.threshold = 0.5)
+
+top5_subset_features <- subset_features %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+DoHeatmap(RB_names, features = top5_subset_features$gene, size =0)
+
+```
+
+##Dot plots
+```{r}
+DefaultAssay(data.combined_subset) <- "RNA"
+Idents(data.combined_subset) <- factor(Idents(data.combined_subset), levels = c("0", "1", "2"))
+markers.to.plot <- c("isl2a", "fgf13a", "prdm14", "kitb", "trpc4a", "calca",
+                 'tmem178', 'adcyap1a', 'prickle1a')
+DotPlot(data.combined_subset, assay = "RNA", features = markers.to.plot, cols = c("blue", "red"), dot.scale = 25) + 
+    RotatedAxis()
+
+FGF_markers.to.plot <- c("etv4", "etv5a", "etv5b","dusp3a","dusp6", "dusp7",  "ets1")
+DotPlot(data.combined_subset, assay = "RNA", features = FGF_markers.to.plot, cols = c("blue", "red"), dot.scale = 35
+        ) + 
+    RotatedAxis()
+```
+
+
+##compare RB gene signature to mouse TG and mouse DRG
+#load mouse trigeminal data 
+```{r}
+
+# Read data in
+counts <- readRDS('GSE197289_snRNA-seq_mouse_raw_counts.RDS')
+meta <- read_csv('GSE197289_snRNA-seq_mouse_barcode_meta.csv.gz')
+
+# Check to see if counts column names and first column of meta align
+sum(colnames(counts) == meta$V1)/ncol(counts)
+
+# Are the unique columns the same?
+cell_freqs <- table(colnames(counts)) # Count number of times each cell is in the count matrix
+dups <- names(cell_freqs)[cell_freqs > 1] # Identify names of each duplicated cell
+
+dup_countsums <- colSums(counts[,colnames(counts) %in% dups]) #calculate the total UMI for each duplicated cell
+
+dup_countsums[sort(names(dup_countsums))] %>% #evaluate whether duplicated cell names have same nUMI
+  head()
+
+# filter to only unique cell names
+counts_filt <- counts[,!colnames(counts) %in% dups]
+meta_filt <- meta %>%
+  filter(! V1 %in% dups) %>%
+  data.frame(., row.names = 'V1')
+
+# Create seurat object
+TG_mouse <- CreateSeuratObject(counts = counts_filt,
+                         meta.data = meta_filt)
+
+seurat_mat <- CreateSeuratObject(counts = counts_filt,
+                         meta.data = meta_filt, project = "Mouse_TG",min.cells = 3, min.features = 400)
+
+#subset so to neurons and control only
+subset_class_id <- c("neuron")
+seurat_mat <- subset(seurat_mat, subset = class %in% subset_class_id )
+
+subset_model_id <- c("Control")
+seurat_mat <- subset(seurat_mat, subset = model %in% subset_model_id )
+
+subset_subtype_id <- c("Injured")
+seurat_mat <- subset(seurat_mat, invert = T, subset = subtype %in% subset_subtype_id )
+
+```
+
+##process mouse TG
+```{r}
+
+
+# calculate mitohondrial genes for each cell
+seurat_mat[["percent.mt"]] <- PercentageFeatureSet(seurat_mat, pattern = "^mt-")
+
+
+nCount_RNA_limits <- c(1e3, 7.5e4)
+nFeature_RNA_limits <- c(1000, 9000)
+percent_mt_limits <- c(0, 5)
+
+seurat_mat <- subset(seurat_mat, subset = nFeature_RNA > min(nFeature_RNA_limits) & nFeature_RNA < max(nFeature_RNA_limits) & nCount_RNA > min(nCount_RNA_limits) & nCount_RNA < max(nCount_RNA_limits) & percent.mt > min(percent_mt_limits) & percent.mt < max(percent_mt_limits))
+
+#Display counts after pruning
+print('Cell count after pruning:')
+table(seurat_mat@meta.data$orig.ident)
+
+# plot QC
+#pdf(paste0("VinPlot_QC.pdf"),heigh=12,width=12)
+VlnPlot(seurat_mat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+# Normalize data, normalization.method = "LogNormalize", scale.factor = 10000
+seurat_mat <- NormalizeData(seurat_mat)
+
+# ID variable genes, selection.method = "vst", nfeatures = 2000
+seurat_mat <- FindVariableFeatures(seurat_mat)
+
+# scale data
+seurat_mat <- ScaleData(object = seurat_mat,vars.to.regress = c("nCount_RNA", "percent.mt"))
+
+# PCA
+seurat_mat <- RunPCA(seurat_mat, features = VariableFeatures(object = seurat_mat),verbose=F)
+
+# dimension reduction and cluster
+seurat_mat <- FindNeighbors(seurat_mat, dims = 1:20)
+seurat_mat <- FindClusters(seurat_mat, resolution = 0.2)
+
+
+# visualization
+#seurat_mat <- RunTSNE(seurat_mat, dims = 1:pc_num)
+seurat_mat <- RunUMAP(seurat_mat, dims = 1:20)
+DimPlot(seurat_mat, reduction = "umap",label = T)
+print(levels(Idents(seurat_mat)))
+
+seurat_mat = AddMetaData(seurat_mat,Embeddings(seurat_mat[["umap"]]),colnames(Embeddings(seurat_mat[["umap"]])))
+
+mouse_meta <- seurat_mat@meta.data
+## markers to annotate clusters
+# markers =list(c('Rbfox3','Sparc','Rgs11','Meg3'),
+#         c('Atf3','Sox11','Sprr1a','Flrt3'),
+#         c('Fam19a4','Th'), #cLTMR
+#         c('Tac1',"Gpx3","Cartpt","Hpca","Trpm8","Calca","Trpv1","Scg2","Adcyap1"), #PEP
+#         c("Cd55","Mrgprd","Lpar3"), #NP
+#         c("Htr3a","Cplx2","Nptx1","Nefh","Hapln4","Pvalb","Cadps2","Ntrk2"), #NF
+#         c("Nppb","Sst","Il31ra"), #SST
+#         c('Apoe','Fabp7','Ednrb'),#Satglia
+#         c('Scn7a'),#Schwann_N
+#         c('Mpz','Mbp'),#Schwann_M,
+#         c('Igfbp7','Tinagl1','Rgs5','Myl9'),#vascular
+#         c('Gfap','Mlc1'), # astrocyte
+#         c('Mog','Hapln2'), # oligodendrocyte
+#         c('Dcn','Mgp','Pdgfra','Ngfr','Alpl'),#fibroblast
+#         c('Lyz2','Mrc1')# Immune
+#          )
+
+```
+
+
+##Rename TG clusters
+```{r}
+#annotation for 20 dim and resolution 0.1
+new.cluster.ids <- c("0-Pep", "1-TRPM8", "2-NP","3-NF1","4-NF1/2","5-cLTMR","6-NF1/2","7-NF3", "8-SST", "9-NP")
+
+names(new.cluster.ids) <- levels(seurat_mat)
+TG_names <- RenameIdents(seurat_mat, new.cluster.ids)
+DimPlot(TG_names, reduction = "umap", label = T, label.size = 5, pt.size = 2) + NoLegend()& 
+  coord_equal() 
+
+TG_names$cluster_ID <- Idents(TG_names)
+TG_names.meta <- TG_names@meta.data
+
+ggplot(TG_names.meta, aes(x = seurat_clusters, fill = orig.ident))+
+  geom_bar(position = 'dodge')
+saveRDS(TG_names, "outs/TG_names")
+```
+
+##Map RB clusters signature onto mouse TG
+```{r}
+#RB clusters  signature
+DefaultAssay(RB_names) <- "RNA"
+
+#kit top DE genes
+kit_deg <- FindMarkers(RB_names,
+                       ident.1 = "kitb+")
+
+kit_top <- kit_deg %>% rownames_to_column("zebrafish_gene") %>%
+  filter(p_val_adj < 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%  
+  slice_head(n = 50)
+
+#calca+ top DE genes
+calca_deg <- FindMarkers(RB_names,
+                       ident.1 = "calca+")
+
+calca_top <- calca_deg %>% rownames_to_column("zebrafish_gene") %>%
+  filter(p_val_adj < 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 50)
+
+#adcyap1a top DE genes
+adcyap1a_deg <- FindMarkers(RB_names,
+                       ident.1 = "adcyap1a+")
+
+adcyap1a_top <- adcyap1a_deg %>% rownames_to_column("zebrafish_gene") %>%
+  filter(p_val_adj < 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 50)
+
+# Pull homologs from biomart
+mouse <- useEnsembl('ensembl', dataset = 'mmusculus_gene_ensembl', host = 'https://dec2021.archive.ensembl.org')
+zebrafish <- useEnsembl('ensembl', dataset = 'drerio_gene_ensembl', host = 'https://dec2021.archive.ensembl.org')
+mm_dr <- getLDS(attributes = c("external_gene_name"),
+       mart = mouse,
+       attributesL = c("external_gene_name"),
+       martL = zebrafish)
+
+# Map DEG gene names
+#kitb cluster 
+kit_mapped <- kit_top %>% # results with mapped gene name stored as 'degs_mapped'
+ # Add zebrafish gene as a column
+filter(zebrafish_gene %in% mm_dr[,2]) %>% # Filter to only include homologs
+mutate(mouse_gene = plyr::mapvalues(x = zebrafish_gene, from = mm_dr[,2], to = mm_dr[,1])) # Map with biomart mm<->dr gene dictionary
+
+#calca cluster
+calca_mapped <- calca_top %>% # results with mapped gene name stored as 'degs_mapped'
+# Add zebrafish gene as a column
+filter(zebrafish_gene %in% mm_dr[,2]) %>% # Filter to only include homologs
+mutate(mouse_gene = plyr::mapvalues(x = zebrafish_gene, from = mm_dr[,2], to = mm_dr[,1])) # Map with biomart mm<->dr gene dictionary
+
+#adcyap1a cluster
+adcyap1a_mapped <- adcyap1a_top %>% # results with mapped gene name stored as 'degs_mapped'
+ # Add zebrafish gene as a column
+filter(zebrafish_gene %in% mm_dr[,2]) %>% # Filter to only include homologs
+mutate(mouse_gene = plyr::mapvalues(x = zebrafish_gene, from = mm_dr[,2], to = mm_dr[,1])) # Map with biomart mm<->dr gene dictionary
+       
+#Add gene signatures to the so
+seurat_mat <- AddModuleScore(seurat_mat, assay = "RNA",
+                     features = list(kit = kit_mapped$mouse_gene),
+                     name = 'kit_')
+
+seurat_mat <- AddModuleScore(seurat_mat, assay = "RNA",
+                     features = list(calca = calca_mapped$mouse_gene),
+                     name = 'calca_')
+
+seurat_mat <- AddModuleScore(seurat_mat, assay = "RNA",
+                     features = list(adcyap1a = adcyap1a_mapped$mouse_gene),
+                     name = 'adcyap1a_')
+#Visualize
+FeaturePlot(seurat_mat, 
+            features = c("kit_1"), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+FeaturePlot(seurat_mat, 
+            features = c("calca_1"), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+FeaturePlot(seurat_mat, 
+            features = c("adcyap1a_1"), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+mouse_aves <- mouse_meta %>%  
+group_by(subtype) %>%  
+dplyr::select(kit_1, calca_1, adcyap1a_1) %>%  
+summarize_all(.funs = mean)
+
+mouse_aves.df <- data.frame(mouse_aves[,-1],
+row.names = mouse_aves$subtype)
+
+pheatmap::pheatmap(mouse_aves.df)
+
+pheatmap::pheatmap(mouse_aves.df, treeheight_col = 0,  cluster_rows = T,         cluster_cols = F, fontsize = 20, display_numbers = round(mouse_aves.df, 2))
+
+```
+
+##Load mouse DRG data
+```{r}
+mouse_1 <- Read10X_h5('mouse_DRG/GSM6069069.h5', use.names = TRUE, unique.features = TRUE)
+DRG_1 <- CreateSeuratObject(counts = mouse_1,
+                           project = "DRG_1", min.cells = 3, min.features = 500)
+
+mouse_2 <- Read10X_h5('mouse_DRG/GSM6069070.h5', use.names = TRUE, unique.features = TRUE)
+DRG_2 <- CreateSeuratObject(counts = mouse_2,
+                           project = "DRG_2", min.cells = 3, min.features = 500)
+
+mouse_3 <- Read10X_h5('mouse_DRG/GSM6069071.h5', use.names = TRUE, unique.features = TRUE)
+DRG_3 <- CreateSeuratObject(counts = mouse_3,
+                           project = "DRG_3", min.cells = 3, min.features = 500)
+
+mouse_4 <- Read10X_h5('mouse_DRG/GSM6069072.h5', use.names = TRUE, unique.features = TRUE)
+DRG_4 <- CreateSeuratObject(counts = mouse_4,
+                           project = "DRG_4", min.cells = 3, min.features = 500)
+
+mouse_5 <- Read10X_h5('mouse_DRG/GSM6069073.h5', use.names = TRUE, unique.features = TRUE)
+DRG_5 <- CreateSeuratObject(counts = mouse_5,
+                           project = "DRG_5", min.cells = 3, min.features = 500)
+
+mouse_6 <- Read10X_h5('mouse_DRG/GSM6069074.h5', use.names = TRUE, unique.features = TRUE)
+DRG_6 <- CreateSeuratObject(counts = mouse_6,
+                           project = "DRG_6", min.cells = 3, min.features = 500)
+
+mouse_7 <- Read10X_h5('mouse_DRG/GSM6069075.h5', use.names = TRUE, unique.features = TRUE)
+DRG_7 <- CreateSeuratObject(counts = mouse_7,
+                           project = "DRG_7", min.cells = 3, min.features = 500)
+
+mouse_8 <- Read10X_h5('mouse_DRG/GSM6069076.h5', use.names = TRUE, unique.features = TRUE)
+DRG_8 <- CreateSeuratObject(counts = mouse_8,
+                           project = "DRG_8", min.cells = 3, min.features = 500)
+
+mouse_9 <- Read10X_h5('mouse_DRG/GSM6069077.h5', use.names = TRUE, unique.features = TRUE)
+DRG_9 <- CreateSeuratObject(counts = mouse_9,
+                           project = "DRG_9", min.cells = 3, min.features = 500)
+
+mouse_10 <- Read10X_h5('mouse_DRG/GSM6069078.h5', use.names = TRUE, unique.features = TRUE)
+DRG_10 <- CreateSeuratObject(counts = mouse_10,
+                           project = "DRG_10", min.cells = 3, min.features = 500)
+
+DRG.combined <- merge(x = DRG_1, y =c(DRG_2, DRG_3, DRG_4, DRG_5, DRG_6, DRG_7, DRG_8, DRG_9, DRG_10), add.cell.ids = c("DRG_1","DRG_2", "DRG_3", "DRG_4","DRG_5","DRG_6","DRG_7","DRG_8","DRG_9","DRG_10"), project = "DRG.combined")
+
+DRG.combined[['condition']] <- str_split(DRG.combined@meta.data$orig.ident, pattern = '_', simplify = TRUE)[,1]
+head(colnames(DRG.combined))
+table(DRG.combined$orig.ident)
+
+```
+
+## Mouse DRG QC
+```{r}
+DRG.combined[["percent.mt"]] <- PercentageFeatureSet(DRG.combined, pattern = "^mt-")
+# Visualize QC metrics as a violin plot
+VlnPlot(DRG.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+
+```
+
+## QC visualization
+
+```{r, eval = TRUE}
+nCount_RNA_limits <- c(1e3, 7.5e4)
+
+nFeature_RNA_limits <- c(1000, 9000)
+
+percent_mt_limits <- c(0, 5)
+```
+
+
+```{r}
+
+FeatureScatter(DRG.combined, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = "orig.ident")+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = percent_mt_limits, linetype = 'dashed', size = 1.5)
+
+FeatureScatter(DRG.combined, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "orig.ident")+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)
+
+DRG.combined_metadata <- DRG.combined@meta.data
+
+ggplot(DRG.combined_metadata, aes(x = nCount_RNA, y = nFeature_RNA))+
+  geom_point(alpha = 0.1)+
+  geom_density2d()+
+  geom_vline(xintercept = nCount_RNA_limits, linetype = 'dashed', size = 1.5)+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)+
+  scale_x_log10()
+
+ggplot(DRG.combined_metadata, aes(x = nCount_RNA/nFeature_RNA, y = nFeature_RNA))+
+  geom_point(alpha = 0.1)+
+  geom_density2d()+
+  geom_hline(yintercept = nFeature_RNA_limits, linetype = 'dashed', size = 1.5)
+
+```
+
+## Subset DRG data
+```{r}
+#Display counts before pruning
+print('Cell count before pruning:')
+table(DRG.combined@meta.data$orig.ident)
+
+DRG.combined <- subset(DRG.combined, subset = nFeature_RNA > min(nFeature_RNA_limits) & nFeature_RNA < max(nFeature_RNA_limits) & nCount_RNA > min(nCount_RNA_limits) & nCount_RNA < max(nCount_RNA_limits) & percent.mt > min(percent_mt_limits) & percent.mt < max(percent_mt_limits))
+
+#Display counts after pruning
+print('Cell count after pruning:')
+table(DRG.combined@meta.data$orig.ident)
+
+```
+
+##Anchor DRG data and normalize
+```{r}
+DRG.combined.list <- SplitObject(DRG.combined, split.by = "orig.ident")
+
+DRG.combined.list <- lapply(X = DRG.combined.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+DRG_anchors <- FindIntegrationAnchors(object.list = DRG.combined.list, dims = 1:30)
+DRG.combined <- IntegrateData(anchorset = DRG_anchors, dims = 1:30)
+```
+
+##Cluster DRG
+```{r}
+# Run the standard workflow for visualization and clustering
+DefaultAssay(DRG.combined) <- "integrated"
+DRG.combined <- ScaleData(DRG.combined, features = row.names(DRG.combined), verbose = FALSE)
+DRG.combined <- RunPCA(DRG.combined, npcs = 30, verbose = FALSE)
+
+DimPlot(DRG.combined, reduction = 'pca')
+ElbowPlot(DRG.combined, ndims = 30)+
+  geom_vline(xintercept = 20.5)
+
+# t-SNE and Clustering
+DRG.combined <- RunUMAP(DRG.combined, reduction = "pca", dims = 1:30)
+DRG.combined <- FindNeighbors(DRG.combined, reduction = "pca", dims = 1:30)
+DRG.combined <- FindClusters(DRG.combined, resolution = 0.3)
+
+DimPlot(DRG.combined, reduction = 'umap', label = TRUE, label.size = 5)+
+  coord_equal()
+DimPlot(DRG.combined, reduction = 'umap', group.by = 'orig.ident')+
+  coord_equal()
+
+```
+# DRG Directed analysis
+
+```{r}
+DefaultAssay(DRG.combined) <- "RNA"
+#remove glial cells
+DRG.combined2 <- DRG.combined %>%
+subset(subset = Mpz < 1 & Plp1 <1 & Sparc <1) 
+#glia
+FeaturePlot(DRG.combined2, features = c('Sparc'),
+            repel = TRUE)+
+  coord_equal()
+#neurons
+FeaturePlot(DRG.combined2, 
+            features = c('Elavl3'), 
+            repel = TRUE, min.cutoff = 0.1) &
+  NoAxes() & 
+  coord_equal() 
+
+```
+## 'Automatic' subset and analysis of DRG neuron clusters
+
+```{r}
+#Set the subset cluster(s) that you're interested in
+DefaultAssay(DRG.combined2) <- "RNA"
+#subset to neuronal clusters only
+DRG_cluster_id <- c(2,6,8,9,11,12,17)
+DefaultAssay(DRG.combined2) <- "integrated"
+##
+##The code below is designed to run automatically once the subset ids are selected above
+##
+
+print('Running automated ~analysis~ on the following clusters:')
+print(DRG_cluster_id)
+
+#Pull the subset
+DRG.combined_subset <- subset(DRG.combined2, subset = seurat_clusters %in% DRG_cluster_id)
+#stash the original cluster identities
+DRG.combined_subset@meta.data$original_seurat_clusters <- DRG.combined_subset@meta.data$seurat_clusters
+
+#Perform relatively hands-free analysis of the selected clusters
+#Perform relatively hands-free analysis of the selected clusters
+DRG.combined_subset <- FindVariableFeatures(DRG.combined_subset)
+DRG.combined_subset <- RunPCA(DRG.combined_subset)
+ElbowPlot(DRG.combined_subset)
+
+
+DRG.combined_subset <- FindNeighbors(DRG.combined_subset, dims = 1:14)
+DRG.combined_subset <- FindClusters(DRG.combined_subset, resolution = .4)
+DRG.combined_subset <- RunUMAP(DRG.combined_subset, dims = 1:14)
+
+
+DRG_plot1 <- DimPlot(DRG.combined_subset, label = TRUE, label.size = 5, group.by = 'seurat_clusters')+
+  ggtitle('New clusters')
+DRG_plot2 <- DimPlot(DRG.combined_subset, label = TRUE, label.size = 5, group.by = 'original_seurat_clusters')+
+  ggtitle('Original cluster identities')
+
+DRG_plot1
+DRG_plot2
+
+DefaultAssay(DRG.combined_subset) <- "RNA"
+FeaturePlot(DRG.combined_subset, features = c('Gfra2', "Gfra3"), min.cutoff = 0.1,
+            repel = TRUE)+
+  coord_equal()
+
+FeaturePlot(DRG.combined_subset,
+            features = c('Mrgpra3'), min.cutoff = 0.1,
+            repel = TRUE) &
+  NoAxes() &
+  coord_equal()
+
+``` 
+
+##Rename DRG clusters
+```{r}
+#annotation for 14 dim and resolution 0.4
+new.cluster.ids <- c("0-cLTMR", "1-NP1.2", "2-NP1.1","3-PEP1.1","4-PEP2.1/2/3","5-Abeta RA","6-PEP1.2","7-NP1.3", "8-cold", "9-NP3", "10-PEP1.2", "11-Proprio & Abeta SA", "12-cLTMR", "13-NP2", "14-Adelta")
+
+ # Annotation according to Min Jung et al., 2022
+# A-LTMRs using Nefh, Slc17a7, Pvalb, Spp1, Calb1, Ntrk3, Scn5a, Ntrk2, Necab2, Cntnap2, and Fam19a1. Non-peptidergic C-fiber nociceptors(NPs) subsets were annotated using Gfra1, Gfra2, Trpc3, Lpar3, Mrgpra3, Mrgprd, Sst, Il31ra, Nppb, Trpv1, Trpa1, Ret, Scn10a, Scn11a, P2rx3, and Plxnc1. C-fiber peptidergic nociceptors (PEPs) subsets were annotated using Tac1, Adcyap1, Gal, Kit, Calca, Ntrk1, Trpa1, Scn10a, and Scn11a. Cold thermoreceptor subsets were annotated using Trpm8, Tac1, Foxp2, Cdh8, Penk, and Piezo2. Finally, C-LTMRs were annotated using Th, Slc17a8, Fam19a4, P2ry1, Gfra2, Piezo2, and Zfp521/ZNF521.
+
+
+names(new.cluster.ids) <- levels(DRG.combined_subset)
+DRG_names <- RenameIdents(DRG.combined_subset, new.cluster.ids)
+DimPlot(DRG_names, reduction = "umap", label = T, label.size = 3, pt.size = 3.5) + NoLegend() & 
+  coord_equal() 
+
+DRG_names$cluster_ID <- Idents(DRG_names)
+saveRDS(DRG_names, "outs/DRG_names")
+
+```
+
+##Map RB clusters signature onto mouse DRG
+```{r}
+#Add gene signatures to the mouse DRG so
+DRG_names <- AddModuleScore(DRG_names, assay = "RNA",
+                     features = list(kit = kit_mapped$mouse_gene),
+                     name = 'kit_')
+
+DRG_names <- AddModuleScore(DRG_names, assay = "RNA",
+                     features = list(calca = calca_mapped$mouse_gene),
+                     name = 'calca_')
+
+DRG_names <- AddModuleScore(DRG_names, assay = "RNA",
+                     features = list(adcyap1a = adcyap1a_mapped$mouse_gene),
+                     name = 'adcyap1a_')
+#Visualize
+FeaturePlot(DRG_names, 
+            features = c("kit_1" ), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+FeaturePlot(DRG_names, 
+            features = c("calca_1"), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+FeaturePlot(DRG_names, 
+            features = c("adcyap1a_1"), 
+            min.cutoff = 0.1, 
+            order = T,
+            repel = TRUE) &
+  NoAxes() & 
+  coord_equal() 
+
+DRG_meta <- DRG_names@meta.data
+mouse_aves <- DRG_meta %>%  
+group_by(cluster_ID) %>%  
+dplyr::select(kit_1, calca_1, adcyap1a_1) %>%  
+summarize_all(.funs = mean)
+
+mouse_aves.df <- data.frame(mouse_aves[,-1],
+row.names = mouse_aves$cluster_ID)
+
+pheatmap::pheatmap(mouse_aves.df)
+
+pheatmap::pheatmap(mouse_aves.df, treeheight_col = 0,   cluster_rows = T,         cluster_cols = F,fontsize = 10, display_numbers = round(mouse_aves.df, 2))
+
+
+```
+
+
+##Volcano plots 
+```{r}
+sub_markers <- FindAllMarkers(RB_names, assay = "RNA",
+                              logfc.threshold = 0.5, only.pos = F)
+
+for(i in unique(sub_markers$cluster)){
+      
+      
+      clust_markers <- sub_markers %>%
+        filter(cluster == i)
+      
+      volcano_plot <- ggplot(clust_markers, aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene))+
+        geom_point()+
+        ggrepel::geom_text_repel()+
+        ggtitle(paste0('Cluster: ', i))+theme_bw() 
+      print(volcano_plot)
+      
+
+}
+
+```
+
+
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+
+
+
+
+
